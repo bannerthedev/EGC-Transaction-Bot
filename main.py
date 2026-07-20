@@ -50,6 +50,7 @@ def load_config():
         "DEFAULT_TIMEZONE": "timezone"
     }
 
+
     for env, key in env_map.items():
         val = os.getenv(env)
         if val is None or val == "":
@@ -70,6 +71,10 @@ def load_config():
     return cfg
 
 CONFIG = load_config()
+
+ROSTER_LOCK_ALL = False
+TEAM_PLAYER_ROLE_NAME = "Team Player"
+
 
 # ---- JSON storage helpers ----
 DATA_DIR = "data"
@@ -93,6 +98,162 @@ INVITES = load_json("invites", {})      # invite_id -> {team_id, inviter_id, use
 MATCHES = load_json("matches", {})      # match_id -> {...}
 TRANSACTIONS = load_json("transactions", [])  # list of transaction messages
 WARNINGS = load_json("warnings", {})    # user_id -> list of warnings
+
+
+
+def get_member_team(member: discord.Member):
+    """
+    Returns (team_id, team_data) for the member's team.
+    Checks captain_id, co_captains, players, and team role.
+    """
+    for tid, team in TEAMS.items():
+        ids = [str(team.get("captain_id"))]
+        ids += [str(x) for x in team.get("co_captains", [])]
+        ids += [str(x) for x in team.get("players", [])]
+
+        if str(member.id) in ids:
+            return tid, team
+
+        role_id = team.get("role_id")
+        if role_id:
+            try:
+                if any(r.id == int(role_id) for r in member.roles):
+                    return tid, team
+            except Exception:
+                pass
+
+    return None, None
+
+
+async def get_or_create_team_player_role(guild: discord.Guild):
+    role = discord.utils.get(guild.roles, name=TEAM_PLAYER_ROLE_NAME)
+    if role:
+        return role
+
+    try:
+        role = await guild.create_role(
+            name=TEAM_PLAYER_ROLE_NAME,
+            reason="Created Team Player role for roster system"
+        )
+        return role
+    except Exception:
+        return None
+
+
+async def add_player_to_team(guild: discord.Guild, member: discord.Member, team_id: str, team: dict):
+    """
+    Adds member to team data and gives roles.
+    """
+    team.setdefault("players", [])
+
+    if str(member.id) not in [str(x) for x in team["players"]]:
+        team["players"].append(str(member.id))
+
+    # Team role
+    role_id = team.get("role_id")
+    if role_id:
+        team_role = guild.get_role(int(role_id))
+        if team_role and team_role not in member.roles:
+            try:
+                await member.add_roles(team_role, reason="Added to team roster")
+            except Exception:
+                pass
+
+    # Team Player role
+    team_player_role = await get_or_create_team_player_role(guild)
+    if team_player_role and team_player_role not in member.roles:
+        try:
+            await member.add_roles(team_player_role, reason="Added Team Player role")
+        except Exception:
+            pass
+
+    save_all()
+
+
+async def remove_player_from_team(guild: discord.Guild, member: discord.Member, team_id: str, team: dict):
+    """
+    Removes member from team data and removes team/player/co-captain roles where needed.
+    """
+    uid = str(member.id)
+
+    team["players"] = [str(p) for p in team.get("players", []) if str(p) != uid]
+    team["co_captains"] = [str(c) for c in team.get("co_captains", []) if str(c) != uid]
+
+    # Remove team role
+    role_id = team.get("role_id")
+    if role_id:
+        team_role = guild.get_role(int(role_id))
+        if team_role and team_role in member.roles:
+            try:
+                await member.remove_roles(team_role, reason="Removed from team roster")
+            except Exception:
+                pass
+
+    # Remove Team Player role
+    team_player_role = discord.utils.get(guild.roles, name=TEAM_PLAYER_ROLE_NAME)
+    if team_player_role and team_player_role in member.roles:
+        try:
+            await member.remove_roles(team_player_role, reason="Removed Team Player role")
+        except Exception:
+            pass
+
+    # Remove co-captain role
+    co_role = get_role_by_cfg(guild, "co_captain")
+    if co_role and co_role in member.roles:
+        try:
+            await member.remove_roles(co_role, reason="Removed from team/co-captain")
+        except Exception:
+            pass
+
+    save_all()
+
+
+def build_roster_text(team: dict):
+    captain_id = team.get("captain_id")
+    co_caps = team.get("co_captains", [])
+    players = team.get("players", [])
+
+    text = f"## Captain Panel — {team.get('name', 'Team')}\n\n"
+
+    text += "**Captain:**\n"
+    text += f"> <@{captain_id}>\n\n" if captain_id else "> None\n\n"
+
+    text += "**Co-Captains:**\n"
+    if co_caps:
+        for cc in co_caps:
+            text += f"> <@{cc}>\n"
+    else:
+        text += "> None\n"
+
+    text += "\n**Players:**\n"
+    if players:
+        for p in players:
+            text += f"> <@{p}>\n"
+    else:
+        text += "> None\n"
+
+    text += f"\n**Roster Size:** {len(players)}/{CONFIG.get('roster_limit', 10)}"
+
+    if ROSTER_LOCK_ALL:
+        text += "\n\n**Roster Lock:** Enabled"
+
+    return text
+
+
+
+
+
+SETTINGS = load_json("settings", {
+    "roster_lock_all": False
+})
+
+def is_roster_locked():
+    return bool(SETTINGS.get("roster_lock_all", False))
+
+def set_roster_lock(value: bool):
+    SETTINGS["roster_lock_all"] = value
+    save_json("settings", SETTINGS)
+
 
 # ---- Bot / Intents ----
 intents = discord.Intents.default()
@@ -149,6 +310,7 @@ def save_all():
     save_json("matches", MATCHES)
     save_json("warnings", WARNINGS)
     save_json("transactions", TRANSACTIONS)
+    save_json("settings", SETTINGS)
 
 # Permission checks
 def is_captain(member, team_id=None):
@@ -163,6 +325,193 @@ def is_co_captain(member):
 def is_admin(member):
     role = get_role_by_cfg(member.guild, "admin")
     return role in member.roles or member.guild_permissions.administrator
+
+
+
+def is_admin_or_above(member: discord.Member):
+    if member.guild_permissions.administrator:
+        return True
+
+    allowed_keys = ["admin", "head", "board"]
+    for key in allowed_keys:
+        role = get_role_by_cfg(member.guild, key)
+        if role and role in member.roles:
+            return True
+
+    return False
+
+
+def get_team_player_role(guild: discord.Guild):
+    role = discord.utils.get(guild.roles, name="Team Player")
+    return role
+
+
+async def add_member_to_team_roles(member: discord.Member, team: dict, reason: str = None):
+    roles_to_add = []
+
+    if team.get("role_id"):
+        team_role = member.guild.get_role(int(team["role_id"]))
+        if team_role and team_role not in member.roles:
+            roles_to_add.append(team_role)
+
+    team_player_role = get_team_player_role(member.guild)
+    if team_player_role and team_player_role not in member.roles:
+        roles_to_add.append(team_player_role)
+
+    if roles_to_add:
+        await member.add_roles(*roles_to_add, reason=reason)
+
+
+async def remove_member_from_team_roles(member: discord.Member, team: dict, reason: str = None):
+    roles_to_remove = []
+
+    if team.get("role_id"):
+        team_role = member.guild.get_role(int(team["role_id"]))
+        if team_role and team_role in member.roles:
+            roles_to_remove.append(team_role)
+
+    team_player_role = get_team_player_role(member.guild)
+    if team_player_role and team_player_role in member.roles:
+        roles_to_remove.append(team_player_role)
+
+    if roles_to_remove:
+        await member.remove_roles(*roles_to_remove, reason=reason)
+
+
+def get_member_team_as_co_captain(member: discord.Member):
+    for team_id, team in TEAMS.items():
+        if str(member.id) in [str(x) for x in team.get("co_captains", [])]:
+            return team_id, team
+    return None, None
+
+
+def is_user_on_any_team(user_id: int | str):
+    user_id = str(user_id)
+
+    for team in TEAMS.values():
+        if str(team.get("captain_id")) == user_id:
+            return True
+
+        if user_id in [str(x) for x in team.get("co_captains", [])]:
+            return True
+
+        if user_id in [str(x) for x in team.get("players", [])]:
+            return True
+
+    return False
+
+
+
+async def get_or_create_team_player_role(guild: discord.Guild):
+    role = get_team_player_role(guild)
+    if role:
+        return role
+
+    try:
+        role = await guild.create_role(
+            name="Team Player",
+            reason="Created by bot for team roster system"
+        )
+        return role
+    except Exception:
+        return None
+
+
+def find_team_by_role_id(role_id):
+    for team_id, team in TEAMS.items():
+        if str(team.get("role_id")) == str(role_id):
+            return team_id, team
+    return None, None
+
+
+def clean_team_id(name: str):
+    return name.lower().replace(" ", "_").replace("-", "_")
+
+
+def parse_hex_color(hex_color: str):
+    hex_color = hex_color.strip().replace("#", "")
+
+    if len(hex_color) != 6:
+        raise ValueError("Invalid hex color length")
+
+    return discord.Color(int(hex_color, 16))
+
+
+def is_admin_or_above(member: discord.Member):
+    if member.guild_permissions.administrator:
+        return True
+
+    allowed_keys = ["admin", "head", "board"]
+    for key in allowed_keys:
+        role = get_role_by_cfg(member.guild, key)
+        if role and role in member.roles:
+            return True
+
+    return False
+
+
+def get_team_player_role(guild: discord.Guild):
+    role = discord.utils.get(guild.roles, name="Team Player")
+    return role
+
+
+async def get_or_create_team_player_role(guild: discord.Guild):
+    role = get_team_player_role(guild)
+    if role:
+        return role
+
+    try:
+        role = await guild.create_role(
+            name="Team Player",
+            reason="Created by bot for team roster system"
+        )
+        return role
+    except Exception:
+        return None
+
+
+def find_team_by_role_id(role_id):
+    for team_id, team in TEAMS.items():
+        if str(team.get("role_id")) == str(role_id):
+            return team_id, team
+    return None, None
+
+
+def clean_team_id(name: str):
+    return name.lower().replace(" ", "_").replace("-", "_")
+
+
+def parse_hex_color(hex_color: str):
+    hex_color = hex_color.strip().replace("#", "")
+
+    if len(hex_color) != 6:
+        raise ValueError("Invalid hex color length")
+
+    return discord.Color(int(hex_color, 16))
+
+
+async def remove_team_member_roles(member: discord.Member, team_role: discord.Role = None):
+    roles_to_remove = []
+
+    captain_role = get_role_by_cfg(member.guild, "captain")
+    co_captain_role = get_role_by_cfg(member.guild, "co_captain")
+    team_player_role = get_team_player_role(member.guild)
+
+    for role in [captain_role, co_captain_role, team_player_role, team_role]:
+        if role and role in member.roles:
+            roles_to_remove.append(role)
+
+    if roles_to_remove:
+        try:
+            await member.remove_roles(
+                *roles_to_remove,
+                reason="Team disband/admin roster update"
+            )
+        except Exception:
+            pass
+
+
+
 
 # ---- UI components helpers ----
 def make_team_select(guild):
@@ -222,6 +571,12 @@ async def show_roster(inter, team_id):
 @tree.command(name="leave", description="Leave your team")
 async def leave(interaction: discord.Interaction):
     member = interaction.user
+
+    if is_roster_locked():
+        return await interaction.response.send_message(
+            "Rosters are currently locked.",
+            ephemeral=True
+        )
     # find team
     found = None
     for tid,t in TEAMS.items():
@@ -239,6 +594,16 @@ async def leave(interaction: discord.Interaction):
                 await member.remove_roles(role, reason="Left team via /leave")
             except:
                 pass
+        team_player_role = get_team_player_role(interaction.guild)
+    if team_player_role and team_player_role in member.roles:
+        try:
+            await member.remove_roles(
+                team_player_role,
+                reason="Left team via /leave"
+            )
+        except Exception:
+            pass
+
     save_all()
     tx = f"<@{member.id}> Has Left **{team.get('name','Team')}**"
     log_transaction(interaction.guild, tx)
@@ -263,205 +628,1267 @@ async def score(interaction: discord.Interaction, winner: str, loser: str, score
     await interaction.response.send_message("Score posted.", ephemeral=True)
 
 # captain-panel
-@tree.command(name="captain-panel", description="Captain panel (captains only)")
+@tree.command(name="captain-panel", description="Captain panel")
 async def captain_panel(interaction: discord.Interaction):
-    if not is_captain(interaction.user):
+    global ROSTER_LOCK_ALL
+
+    if not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+
+    guild = interaction.guild
+    member = interaction.user
+
+    # Must have captain role
+    if not is_captain(member):
         return await interaction.response.send_message("Captain role required.", ephemeral=True)
-    # Build roster display + buttons
-    # We'll assume team lookup by captain role presence or a configured team for this captain.
+
+    # Find team where user is captain
+    team_id = None
     team = None
-    for tid,t in TEAMS.items():
-        if str(t.get("captain_id")) == str(interaction.user.id):
-            team = (tid,t); break
+
+    for tid, t in TEAMS.items():
+        if str(t.get("captain_id")) == str(member.id):
+            team_id = tid
+            team = t
+            break
+
     if not team:
-        return await interaction.response.send_message("No team found for you. Contact admin.", ephemeral=True)
-    tid, t = team
-    # create view
-    view = discord.ui.View(timeout=None)
-    # Invite button
-    class InviteButton(discord.ui.Button):
-        def __init__(self): super().__init__(style=discord.ButtonStyle.primary, label="Invite")
-        async def callback(self, button_inter):
-            # present select of guild members
+        return await interaction.response.send_message("No team found for you. Contact an admin.", ephemeral=True)
+
+    roster_limit = int(CONFIG.get("roster_limit", 10))
+
+    class CaptainPanelView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=300)
+
+        async def interaction_check(self, btn_inter: discord.Interaction) -> bool:
+            if str(btn_inter.user.id) != str(member.id):
+                await btn_inter.response.send_message("Only this team's captain can use this panel.", ephemeral=True)
+                return False
+            return True
+
+        @discord.ui.button(label="Invite", style=discord.ButtonStyle.primary)
+        async def invite_button(self, btn_inter: discord.Interaction, button: discord.ui.Button):
+            if ROSTER_LOCK_ALL:
+                return await btn_inter.response.send_message("Rosters are currently locked.", ephemeral=True)
+
+            current_size = len(team.get("players", []))
+            if current_size >= roster_limit:
+                return await btn_inter.response.send_message("Your roster is full.", ephemeral=True)
+
             options = []
-            for m in interaction.guild.members:
-                # skip bots
-                if m.bot: continue
-                options.append(discord.SelectOption(label=m.display_name, value=str(m.id)))
-                if len(options) >= 25: break
+
+            for m in guild.members:
+                if m.bot:
+                    continue
+
+                # skip people already on a team
+                existing_tid, existing_team = get_member_team(m)
+                if existing_team:
+                    continue
+
+                options.append(discord.SelectOption(label=m.display_name[:100], value=str(m.id)))
+
+                if len(options) >= 25:
+                    break
+
             if not options:
-                return await button_inter.response.send_message("No members to invite.", ephemeral=True)
-            select = discord.ui.Select(placeholder="Invite member...", options=options, min_values=1, max_values=1)
-            sel_view = discord.ui.View(timeout=60)
-            async def select_cb(sel_inter):
-                user_id = sel_inter.data["values"][0]
-                inviter = button_inter.user
+                return await btn_inter.response.send_message("No available members found to invite.", ephemeral=True)
+
+            select = discord.ui.Select(
+                placeholder="Choose a member to invite",
+                options=options,
+                min_values=1,
+                max_values=1
+            )
+
+            invite_view = discord.ui.View(timeout=60)
+
+            async def select_callback(select_inter: discord.Interaction):
+                user_id = select.values[0]
+                invited_member = guild.get_member(int(user_id))
+
+                if not invited_member:
+                    return await select_inter.response.send_message("Member not found.", ephemeral=True)
+
+                existing_tid, existing_team = get_member_team(invited_member)
+                if existing_team:
+                    return await select_inter.response.send_message("That member is already on a team.", ephemeral=True)
+
+                if len(team.get("players", [])) >= roster_limit:
+                    return await select_inter.response.send_message("Your roster is now full.", ephemeral=True)
+
                 invite_id = secrets.token_hex(8)
-                INVITES[invite_id] = {"team_id": tid, "inviter_id": str(inviter.id), "user_id": str(user_id), "status":"pending"}
+
+                INVITES[invite_id] = {
+                    "team_id": team_id,
+                    "inviter_id": str(member.id),
+                    "user_id": str(invited_member.id),
+                    "status": "pending"
+                }
+
                 save_all()
-                # DM the user
-                member = interaction.guild.get_member(int(user_id))
-                if member:
+
+                class InviteResponseView(discord.ui.View):
+                    def __init__(self):
+                        super().__init__(timeout=86400)
+
+                    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
+                    async def accept_invite(self, invite_inter: discord.Interaction, accept_button: discord.ui.Button):
+                        if str(invite_inter.user.id) != str(invited_member.id):
+                            return await invite_inter.response.send_message("This invite is not for you.", ephemeral=True)
+
+                        if INVITES.get(invite_id, {}).get("status") != "pending":
+                            return await invite_inter.response.send_message("This invite is no longer active.", ephemeral=True)
+
+                        existing_tid, existing_team = get_member_team(invited_member)
+                        if existing_team:
+                            INVITES[invite_id]["status"] = "cancelled"
+                            save_all()
+                            return await invite_inter.response.edit_message(
+                                content="You are already on a team, so this invite was cancelled.",
+                                view=None
+                            )
+
+                        if len(team.get("players", [])) >= roster_limit:
+                            INVITES[invite_id]["status"] = "cancelled"
+                            save_all()
+                            return await invite_inter.response.edit_message(
+                                content="This team's roster is full.",
+                                view=None
+                            )
+
+                        await add_player_to_team(guild, invited_member, team_id, team)
+
+                        INVITES[invite_id]["status"] = "accepted"
+                        save_all()
+
+                        log_transaction(guild, f"<@{invited_member.id}> Has Joined **{team.get('name', 'Team')}**")
+
+                        await invite_inter.response.edit_message(
+                            content=f"You accepted the invite to **{team.get('name', 'Team')}**.",
+                            view=None
+                        )
+
+                    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger)
+                    async def decline_invite(self, invite_inter: discord.Interaction, decline_button: discord.ui.Button):
+                        if str(invite_inter.user.id) != str(invited_member.id):
+                            return await invite_inter.response.send_message("This invite is not for you.", ephemeral=True)
+
+                        INVITES[invite_id]["status"] = "declined"
+                        save_all()
+
+                        await invite_inter.response.edit_message(
+                            content=f"You declined the invite to **{team.get('name', 'Team')}**.",
+                            view=None
+                        )
+
+                try:
+                    await invited_member.send(
+                        f"You've been invited to **{team.get('name', 'Team')}** by {member.mention}.\n"
+                        f"Use the buttons below to accept or decline.",
+                        view=InviteResponseView()
+                    )
+
+                    await select_inter.response.send_message(
+                        f"Invite sent to {invited_member.mention}.",
+                        ephemeral=True
+                    )
+
+                except Exception:
+                    INVITES[invite_id]["status"] = "failed_dm"
+                    save_all()
+
+                    await select_inter.response.send_message(
+                        "I could not DM that user. They may have DMs disabled.",
+                        ephemeral=True
+                    )
+
+            select.callback = select_callback
+            invite_view.add_item(select)
+
+            await btn_inter.response.send_message("Select a member to invite:", view=invite_view, ephemeral=True)
+
+        @discord.ui.button(label="Kick", style=discord.ButtonStyle.danger)
+        async def kick_button(self, btn_inter: discord.Interaction, button: discord.ui.Button):
+            if ROSTER_LOCK_ALL:
+                return await btn_inter.response.send_message("Rosters are currently locked.", ephemeral=True)
+
+            options = []
+
+            all_ids = []
+
+            for pid in team.get("players", []):
+                if str(pid) not in all_ids:
+                    all_ids.append(str(pid))
+
+            for cc in team.get("co_captains", []):
+                if str(cc) not in all_ids:
+                    all_ids.append(str(cc))
+
+            for uid in all_ids:
+                m = guild.get_member(int(uid))
+                if not m:
+                    continue
+
+                label = m.display_name
+                if str(uid) in [str(x) for x in team.get("co_captains", [])]:
+                    label += " — Co-Captain"
+
+                options.append(discord.SelectOption(label=label[:100], value=str(uid)))
+
+                if len(options) >= 25:
+                    break
+
+            if not options:
+                return await btn_inter.response.send_message("There are no players to kick.", ephemeral=True)
+
+            select = discord.ui.Select(
+                placeholder="Choose a player to kick",
+                options=options,
+                min_values=1,
+                max_values=1
+            )
+
+            kick_view = discord.ui.View(timeout=60)
+
+            async def kick_callback(select_inter: discord.Interaction):
+                user_id = select.values[0]
+                kicked_member = guild.get_member(int(user_id))
+
+                if not kicked_member:
+                    return await select_inter.response.send_message("Member not found.", ephemeral=True)
+
+                await remove_player_from_team(guild, kicked_member, team_id, team)
+
+                log_transaction(
+                    guild,
+                    f"<@{kicked_member.id}> Has Been Kicked From **{team.get('name', 'Team')}**"
+                )
+
+                await select_inter.response.send_message(
+                    f"{kicked_member.mention} was kicked from **{team.get('name', 'Team')}**.",
+                    ephemeral=True
+                )
+
+            select.callback = kick_callback
+            kick_view.add_item(select)
+
+            await btn_inter.response.send_message("Select a player to kick:", view=kick_view, ephemeral=True)
+
+        @discord.ui.button(label="Add Co-Captain", style=discord.ButtonStyle.secondary)
+        async def add_co_button(self, btn_inter: discord.Interaction, button: discord.ui.Button):
+            if ROSTER_LOCK_ALL:
+                return await btn_inter.response.send_message("Rosters are currently locked.", ephemeral=True)
+
+            options = []
+
+            for pid in team.get("players", []):
+                if str(pid) in [str(x) for x in team.get("co_captains", [])]:
+                    continue
+
+                m = guild.get_member(int(pid))
+                if not m:
+                    continue
+
+                options.append(discord.SelectOption(label=m.display_name[:100], value=str(pid)))
+
+                if len(options) >= 25:
+                    break
+
+            if not options:
+                return await btn_inter.response.send_message("No eligible players to promote.", ephemeral=True)
+
+            select = discord.ui.Select(
+                placeholder="Choose a player to make Co-Captain",
+                options=options,
+                min_values=1,
+                max_values=1
+            )
+
+            co_view = discord.ui.View(timeout=60)
+
+            async def add_co_callback(select_inter: discord.Interaction):
+                user_id = select.values[0]
+                co_member = guild.get_member(int(user_id))
+
+                if not co_member:
+                    return await select_inter.response.send_message("Member not found.", ephemeral=True)
+
+                team.setdefault("co_captains", [])
+
+                if str(user_id) not in [str(x) for x in team["co_captains"]]:
+                    team["co_captains"].append(str(user_id))
+
+                co_role = get_role_by_cfg(guild, "co_captain")
+                if co_role and co_role not in co_member.roles:
                     try:
-                        dm_v = discord.ui.View()
-                        async def accept_cb(i):
-                            # add to team
-                            t.setdefault("players",[]).append(str(user_id))
-                            INVITES[invite_id]["status"] = "accepted"
-                            save_all()
-                            log_transaction(interaction.guild, f"<@{user_id}> Has Joined **{t.get('name')}**")
-                            await i.response.edit_message(content="You accepted invite.", view=None)
-                        async def decline_cb(i):
-                            INVITES[invite_id]["status"] = "declined"
-                            save_all()
-                            await i.response.edit_message(content="You declined invite.", view=None)
-                        b_accept = discord.ui.Button(label="Accept", style=discord.ButtonStyle.success)
-                        b_accept.callback = accept_cb
-                        b_decline = discord.ui.Button(label="Decline", style=discord.ButtonStyle.danger)
-                        b_decline.callback = decline_cb
-                        dm_v.add_item(b_accept)
-                        dm_v.add_item(b_decline)
-                        await member.send(f"You've been invited to **{t.get('name')}**\n{interaction.user.mention} invited you to join **{t.get('name')}**. Use the buttons below to respond:", view=dm_v)
+                        await co_member.add_roles(co_role, reason="Promoted to Co-Captain")
                     except Exception:
                         pass
-                await sel_inter.response.send_message("Invite sent (if DM allowed).", ephemeral=True)
-            select.callback = select_cb
-            sel_view.add_item(select)
-            await button_inter.response.send_message("Choose a member to invite:", view=sel_view, ephemeral=True)
 
-    class KickButton(discord.ui.Button):
-        def __init__(self): super().__init__(style=discord.ButtonStyle.danger, label="Kick")
-        async def callback(self, button_inter):
-            # Show roster select (players + co-caps)
-            opts = []
-            for pid in t.get("players",[]):
-                member = interaction.guild.get_member(int(pid))
-                if member:
-                    opts.append(discord.SelectOption(label=member.display_name, value=str(pid)))
-            for cc in t.get("co_captains",[]):
-                member = interaction.guild.get_member(int(cc))
-                if member:
-                    opts.append(discord.SelectOption(label=member.display_name+" (co-captain)", value=str(cc)))
-            if not opts:
-                return await button_inter.response.send_message("No players to kick.", ephemeral=True)
-            sel = discord.ui.Select(placeholder="Select to kick", options=opts)
-            v = discord.ui.View(timeout=60)
-            async def sel_cb(si):
-                uid = si.data["values"][0]
-                t["players"] = [p for p in t.get("players",[]) if str(p) != str(uid)]
-                t["co_captains"] = [c for c in t.get("co_captains",[]) if str(c) != str(uid)]
                 save_all()
-                log_transaction(button_inter.guild, f"<@{uid}> Has Been kicked from **{t.get('name')}**")
-                await si.response.send_message("User kicked.", ephemeral=True)
-            sel.callback = sel_cb
-            v.add_item(sel)
-            await button_inter.response.send_message("Choose player to kick:", view=v, ephemeral=True)
 
-    class AddCoButton(discord.ui.Button):
-        def __init__(self): super().__init__(style=discord.ButtonStyle.secondary, label="Add Co-Captain")
-        async def callback(self, button_inter):
-            opts = []
-            for pid in t.get("players",[]):
-                member = interaction.guild.get_member(int(pid))
-                if member:
-                    opts.append(discord.SelectOption(label=member.display_name, value=str(pid)))
-            if not opts:
-                return await button_inter.response.send_message("No players available.", ephemeral=True)
-            sel = discord.ui.Select(placeholder="Promote to Co-Captain", options=opts)
-            v = discord.ui.View()
-            async def cb(si):
-                uid = si.data["values"][0]
-                if uid not in [str(x) for x in t.get("co_captains",[])]:
-                    t.setdefault("co_captains",[]).append(str(uid))
-                    save_all()
-                    log_transaction(button_inter.guild, f"<@{uid}> Has Been promoted to Co-Captain")
-                await si.response.send_message("Promoted.", ephemeral=True)
-            sel.callback = cb
-            v.add_item(sel)
-            await button_inter.response.send_message("Choose player to promote:", view=v, ephemeral=True)
+                log_transaction(
+                    guild,
+                    f"<@{co_member.id}> Has Been Promoted To Co-Captain Of **{team.get('name', 'Team')}**"
+                )
 
-    class RemoveCoButton(discord.ui.Button):
-        def __init__(self): super().__init__(style=discord.ButtonStyle.secondary, label="Remove Co-Captain")
-        async def callback(self, button_inter):
-            opts = []
-            for cc in t.get("co_captains",[]):
-                member = interaction.guild.get_member(int(cc))
-                if member:
-                    opts.append(discord.SelectOption(label=member.display_name, value=str(cc)))
-            if not opts:
-                return await button_inter.response.send_message("No co-captains.", ephemeral=True)
-            sel = discord.ui.Select(placeholder="Remove Co-Captain", options=opts)
-            v = discord.ui.View()
-            async def cb(si):
-                uid = si.data["values"][0]
-                t["co_captains"] = [c for c in t.get("co_captains",[]) if str(c) != str(uid)]
+                await select_inter.response.send_message(
+                    f"{co_member.mention} is now a Co-Captain.",
+                    ephemeral=True
+                )
+
+            select.callback = add_co_callback
+            co_view.add_item(select)
+
+            await btn_inter.response.send_message("Select a player to promote:", view=co_view, ephemeral=True)
+
+        @discord.ui.button(label="Remove Co-Captain", style=discord.ButtonStyle.secondary)
+        async def remove_co_button(self, btn_inter: discord.Interaction, button: discord.ui.Button):
+            if ROSTER_LOCK_ALL:
+                return await btn_inter.response.send_message("Rosters are currently locked.", ephemeral=True)
+
+            options = []
+
+            for cc in team.get("co_captains", []):
+                m = guild.get_member(int(cc))
+                if not m:
+                    continue
+
+                options.append(discord.SelectOption(label=m.display_name[:100], value=str(cc)))
+
+                if len(options) >= 25:
+                    break
+
+            if not options:
+                return await btn_inter.response.send_message("There are no Co-Captains to remove.", ephemeral=True)
+
+            select = discord.ui.Select(
+                placeholder="Choose a Co-Captain to remove",
+                options=options,
+                min_values=1,
+                max_values=1
+            )
+
+            remove_view = discord.ui.View(timeout=60)
+
+            async def remove_co_callback(select_inter: discord.Interaction):
+                user_id = select.values[0]
+                co_member = guild.get_member(int(user_id))
+
+                team["co_captains"] = [
+                    str(c) for c in team.get("co_captains", [])
+                    if str(c) != str(user_id)
+                ]
+
+                if co_member:
+                    co_role = get_role_by_cfg(guild, "co_captain")
+                    if co_role and co_role in co_member.roles:
+                        try:
+                            await co_member.remove_roles(co_role, reason="Removed Co-Captain")
+                        except Exception:
+                            pass
+
                 save_all()
-                log_transaction(button_inter.guild, f"<@{uid}> Has Been demoted from Co-Captain")
-                await si.response.send_message("Removed.", ephemeral=True)
-            sel.callback = cb
-            v.add_item(sel)
-            await button_inter.response.send_message("Choose co-captain to remove:", view=v, ephemeral=True)
 
-    class TransferButton(discord.ui.Button):
-        def __init__(self): super().__init__(style=discord.ButtonStyle.secondary, label="Transfer Captain")
-        async def callback(self, button_inter):
-            opts = []
-            for pid in t.get("players",[])+[t.get("captain_id")] + t.get("co_captains",[]):
-                m = interaction.guild.get_member(int(pid))
-                if m:
-                    opts.append(discord.SelectOption(label=m.display_name, value=str(pid)))
-            sel = discord.ui.Select(placeholder="Transfer to...", options=opts)
-            v = discord.ui.View()
-            async def cb(si):
-                new_id = si.data["values"][0]
-                old = t.get("captain_id")
-                t["captain_id"] = str(new_id)
-                # optionally demote old to player
-                if old and str(old) not in t.get("players",[]):
-                    t.setdefault("players",[]).append(str(old))
+                log_transaction(
+                    guild,
+                    f"<@{user_id}> Has Been Removed As Co-Captain Of **{team.get('name', 'Team')}**"
+                )
+
+                await select_inter.response.send_message(
+                    f"<@{user_id}> is no longer a Co-Captain.",
+                    ephemeral=True
+                )
+
+            select.callback = remove_co_callback
+            remove_view.add_item(select)
+
+            await btn_inter.response.send_message("Select a Co-Captain to remove:", view=remove_view, ephemeral=True)
+
+        @discord.ui.button(label="Transfer Captain", style=discord.ButtonStyle.secondary)
+        async def transfer_button(self, btn_inter: discord.Interaction, button: discord.ui.Button):
+            if ROSTER_LOCK_ALL:
+                return await btn_inter.response.send_message("Rosters are currently locked.", ephemeral=True)
+
+            options = []
+
+            possible_ids = []
+
+            for pid in team.get("players", []):
+                if str(pid) not in possible_ids:
+                    possible_ids.append(str(pid))
+
+            for cc in team.get("co_captains", []):
+                if str(cc) not in possible_ids:
+                    possible_ids.append(str(cc))
+
+            for uid in possible_ids:
+                if str(uid) == str(member.id):
+                    continue
+
+                m = guild.get_member(int(uid))
+                if not m:
+                    continue
+
+                options.append(discord.SelectOption(label=m.display_name[:100], value=str(uid)))
+
+                if len(options) >= 25:
+                    break
+
+            if not options:
+                return await btn_inter.response.send_message("No eligible members to transfer captain to.", ephemeral=True)
+
+            select = discord.ui.Select(
+                placeholder="Choose the new Captain",
+                options=options,
+                min_values=1,
+                max_values=1
+            )
+
+            transfer_view = discord.ui.View(timeout=60)
+
+            async def transfer_callback(select_inter: discord.Interaction):
+                new_captain_id = select.values[0]
+                old_captain_id = str(team.get("captain_id"))
+
+                new_captain = guild.get_member(int(new_captain_id))
+                old_captain = guild.get_member(int(old_captain_id))
+
+                if not new_captain:
+                    return await select_inter.response.send_message("New captain member not found.", ephemeral=True)
+
+                captain_role = get_role_by_cfg(guild, "captain")
+                co_role = get_role_by_cfg(guild, "co_captain")
+
+                # Update data
+                team["captain_id"] = str(new_captain_id)
+
+                # New captain should not be listed as normal player/co-captain
+                team["players"] = [
+                    str(p) for p in team.get("players", [])
+                    if str(p) != str(new_captain_id)
+                ]
+
+                team["co_captains"] = [
+                    str(c) for c in team.get("co_captains", [])
+                    if str(c) != str(new_captain_id)
+                ]
+
+                # Old captain becomes player
+                if old_captain_id and old_captain_id not in [str(p) for p in team.get("players", [])]:
+                    team.setdefault("players", []).append(old_captain_id)
+
+                # Role changes
+                if captain_role:
+                    try:
+                        if old_captain and captain_role in old_captain.roles:
+                            await old_captain.remove_roles(captain_role, reason="Captain transferred")
+                    except Exception:
+                        pass
+
+                    try:
+                        if captain_role not in new_captain.roles:
+                            await new_captain.add_roles(captain_role, reason="Captain transferred")
+                    except Exception:
+                        pass
+
+                if co_role and co_role in new_captain.roles:
+                    try:
+                        await new_captain.remove_roles(co_role, reason="Captain transferred")
+                    except Exception:
+                        pass
+
+                # Ensure old captain has team role and Team Player role
+                if old_captain:
+                    await add_player_to_team(guild, old_captain, team_id, team)
+
                 save_all()
-                log_transaction(button_inter.guild, f"<@{old}> Has Transferred Captain to <@{new_id}>")
-                await si.response.send_message("Captain transferred.", ephemeral=True)
-            sel.callback = cb
-            v.add_item(sel)
-            await button_inter.response.send_message("Choose new captain:", view=v, ephemeral=True)
 
-    # add buttons to view
-    view.add_item(InviteButton())
-    view.add_item(KickButton())
-    view.add_item(AddCoButton())
-    view.add_item(RemoveCoButton())
-    view.add_item(TransferButton())
+                log_transaction(
+                    guild,
+                    f"<@{old_captain_id}> Has Transferred Captain Of **{team.get('name', 'Team')}** To <@{new_captain_id}>"
+                )
 
-    roster_text = f"Team {t.get('name')}\nPlayers: {len(t.get('players',[]))}/{CONFIG.get('roster_limit')}"
-    await interaction.response.send_message(roster_text, view=view, ephemeral=True)
+                await select_inter.response.send_message(
+                    f"Captain transferred to <@{new_captain_id}>.",
+                    ephemeral=True
+                )
+
+            select.callback = transfer_callback
+            transfer_view.add_item(select)
+
+            await btn_inter.response.send_message("Select the new Captain:", view=transfer_view, ephemeral=True)
+
+    await interaction.response.send_message(
+        build_roster_text(team),
+        view=CaptainPanelView(),
+        ephemeral=True
+    )
 
 # co-captain-panel: similar but fewer buttons
 @tree.command(name="co-captain-panel", description="Co-captain panel (co-captains only)")
 async def co_captain_panel(interaction: discord.Interaction):
+    global ROSTER_LOCK_ALL
+
+    if ROSTER_LOCK_ALL:
+        return await interaction.response.send_message(
+            "Rosters are currently locked by staff.",
+            ephemeral=True
+        )
+
     if not is_co_captain(interaction.user):
-        return await interaction.response.send_message("Co-Captain role required.", ephemeral=True)
-    # find a team this user is co-captain of
-    team = None
-    for tid,t in TEAMS.items():
-        if str(interaction.user.id) in [str(x) for x in t.get("co_captains",[])]:
-            team = (tid,t); break
+        return await interaction.response.send_message(
+            "Co-Captain role required.",
+            ephemeral=True
+        )
+
+    team_id, team = get_member_team_as_co_captain(interaction.user)
+
     if not team:
-        return await interaction.response.send_message("No team found for you.", ephemeral=True)
-    tid,t = team
-    view = discord.ui.View(timeout=None)
-    # Invite and Kick only
-    class SimpleInvite(discord.ui.Button):
-        def __init__(self): super().__init__(label="Invite", style=discord.ButtonStyle.primary)
-        async def callback(self, btn_int):
-            await captain_panel.callback.__wrapped__(interaction)  # reuse flow roughly
-    class SimpleKick(discord.ui.Button):
-        def __init__(self): super().__init__(label="Kick", style=discord.ButtonStyle.danger)
-        async def callback(self, btn_int):
-            await interaction.response.send_message("Please use the captain to kick.", ephemeral=True)
-    view.add_item(SimpleInvite())
-    view.add_item(SimpleKick())
-    await interaction.response.send_message(f"Co-Captain panel for {t.get('name')}", view=view, ephemeral=True)
+        return await interaction.response.send_message(
+            "No team found for you.",
+            ephemeral=True
+        )
+
+    guild = interaction.guild
+    roster_limit = int(CONFIG.get("roster_limit", 10))
+
+    def build_panel_text():
+        captain_id = team.get("captain_id")
+        co_captains = team.get("co_captains", [])
+        players = team.get("players", [])
+
+        text = f"**Co-Captain Panel — {team.get('name', 'Team')}**\n\n"
+
+        text += "**Captain:**\n"
+        text += f"> <@{captain_id}>\n\n" if captain_id else "> None\n\n"
+
+        text += "**Co-Captains:**\n"
+        if co_captains:
+            for cc in co_captains:
+                text += f"> <@{cc}>\n"
+        else:
+            text += "> None\n"
+
+        text += "\n**Players:**\n"
+        if players:
+            for player_id in players:
+                text += f"> <@{player_id}>\n"
+        else:
+            text += "> None\n"
+
+        text += f"\n**Roster:** {len(players)}/{roster_limit}"
+
+        return text
+
+    class CoCaptainInviteButton(discord.ui.Button):
+        def __init__(self):
+            super().__init__(
+                label="Invite Player",
+                style=discord.ButtonStyle.primary
+            )
+
+        async def callback(self, button_interaction: discord.Interaction):
+            global ROSTER_LOCK_ALL
+
+            if ROSTER_LOCK_ALL:
+                return await button_interaction.response.send_message(
+                    "Rosters are currently locked by staff.",
+                    ephemeral=True
+                )
+
+            if button_interaction.user.id != interaction.user.id:
+                return await button_interaction.response.send_message(
+                    "This is not your panel.",
+                    ephemeral=True
+                )
+
+            current_players = team.get("players", [])
+
+            if len(current_players) >= roster_limit:
+                return await button_interaction.response.send_message(
+                    "Your roster is full.",
+                    ephemeral=True
+                )
+
+            options = []
+
+            for member in guild.members:
+                if member.bot:
+                    continue
+
+                if member.id == interaction.user.id:
+                    continue
+
+                if is_user_on_any_team(member.id):
+                    continue
+
+                options.append(
+                    discord.SelectOption(
+                        label=member.display_name[:100],
+                        value=str(member.id)
+                    )
+                )
+
+                if len(options) >= 25:
+                    break
+
+            if not options:
+                return await button_interaction.response.send_message(
+                    "No available members found to invite.",
+                    ephemeral=True
+                )
+
+            select = discord.ui.Select(
+                placeholder="Select a player to invite...",
+                options=options,
+                min_values=1,
+                max_values=1
+            )
+
+            invite_view = discord.ui.View(timeout=60)
+
+            async def select_callback(select_interaction: discord.Interaction):
+                selected_user_id = select_interaction.data["values"][0]
+                selected_member = guild.get_member(int(selected_user_id))
+
+                if not selected_member:
+                    return await select_interaction.response.send_message(
+                        "That member could not be found.",
+                        ephemeral=True
+                    )
+
+                if is_user_on_any_team(selected_member.id):
+                    return await select_interaction.response.send_message(
+                        "That member is already on a team.",
+                        ephemeral=True
+                    )
+
+                invite_id = secrets.token_hex(8)
+
+                INVITES[invite_id] = {
+                    "team_id": team_id,
+                    "inviter_id": str(select_interaction.user.id),
+                    "user_id": str(selected_member.id),
+                    "status": "pending"
+                }
+
+                save_all()
+
+                class InviteResponseView(discord.ui.View):
+                    def __init__(self):
+                        super().__init__(timeout=None)
+
+                    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
+                    async def accept_invite(
+                        self,
+                        dm_interaction: discord.Interaction,
+                        button: discord.ui.Button
+                    ):
+                        global ROSTER_LOCK_ALL
+
+                        if ROSTER_LOCK_ALL:
+                            return await dm_interaction.response.send_message(
+                                "Rosters are currently locked by staff.",
+                                ephemeral=True
+                            )
+
+                        invite = INVITES.get(invite_id)
+
+                        if not invite or invite.get("status") != "pending":
+                            return await dm_interaction.response.send_message(
+                                "This invite is no longer valid.",
+                                ephemeral=True
+                            )
+
+                        if is_user_on_any_team(selected_member.id):
+                            invite["status"] = "expired"
+                            save_all()
+
+                            return await dm_interaction.response.send_message(
+                                "You are already on a team.",
+                                ephemeral=True
+                            )
+
+                        if len(team.get("players", [])) >= roster_limit:
+                            invite["status"] = "expired"
+                            save_all()
+
+                            return await dm_interaction.response.send_message(
+                                "That team's roster is now full.",
+                                ephemeral=True
+                            )
+
+                        team.setdefault("players", [])
+
+                        if str(selected_member.id) not in [str(x) for x in team["players"]]:
+                            team["players"].append(str(selected_member.id))
+
+                        invite["status"] = "accepted"
+
+                        try:
+                            await add_member_to_team_roles(
+                                selected_member,
+                                team,
+                                reason="Accepted team invite"
+                            )
+                        except Exception:
+                            pass
+
+                        save_all()
+
+                        log_transaction(
+                            guild,
+                            f"<@{selected_member.id}> Has Joined **{team.get('name', 'Team')}**"
+                        )
+
+                        await dm_interaction.response.edit_message(
+                            content=f"You accepted the invite to **{team.get('name', 'Team')}**.",
+                            view=None
+                        )
+
+                    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger)
+                    async def decline_invite(
+                        self,
+                        dm_interaction: discord.Interaction,
+                        button: discord.ui.Button
+                    ):
+                        invite = INVITES.get(invite_id)
+
+                        if invite:
+                            invite["status"] = "declined"
+                            save_all()
+
+                        await dm_interaction.response.edit_message(
+                            content=f"You declined the invite to **{team.get('name', 'Team')}**.",
+                            view=None
+                        )
+
+                try:
+                    await selected_member.send(
+                        f"You have been invited to join **{team.get('name', 'Team')}**.\n"
+                        f"Invited by: {select_interaction.user.mention}\n\n"
+                        f"Use the buttons below to accept or decline.",
+                        view=InviteResponseView()
+                    )
+
+                    await select_interaction.response.send_message(
+                        f"Invite sent to {selected_member.mention}.",
+                        ephemeral=True
+                    )
+
+                except Exception:
+                    await select_interaction.response.send_message(
+                        "Could not DM that member. They may have DMs closed.",
+                        ephemeral=True
+                    )
+
+            select.callback = select_callback
+            invite_view.add_item(select)
+
+            await button_interaction.response.send_message(
+                "Choose a player to invite:",
+                view=invite_view,
+                ephemeral=True
+            )
+
+    class CoCaptainKickButton(discord.ui.Button):
+        def __init__(self):
+            super().__init__(
+                label="Kick Player",
+                style=discord.ButtonStyle.danger
+            )
+
+        async def callback(self, button_interaction: discord.Interaction):
+            global ROSTER_LOCK_ALL
+
+            if ROSTER_LOCK_ALL:
+                return await button_interaction.response.send_message(
+                    "Rosters are currently locked by staff.",
+                    ephemeral=True
+                )
+
+            if button_interaction.user.id != interaction.user.id:
+                return await button_interaction.response.send_message(
+                    "This is not your panel.",
+                    ephemeral=True
+                )
+
+            players = team.get("players", [])
+
+            if not players:
+                return await button_interaction.response.send_message(
+                    "There are no players to kick.",
+                    ephemeral=True
+                )
+
+            options = []
+
+            for player_id in players:
+                member = guild.get_member(int(player_id))
+
+                if member:
+                    options.append(
+                        discord.SelectOption(
+                            label=member.display_name[:100],
+                            value=str(member.id)
+                        )
+                    )
+
+            if not options:
+                return await button_interaction.response.send_message(
+                    "No valid players found to kick.",
+                    ephemeral=True
+                )
+
+            select = discord.ui.Select(
+                placeholder="Select a player to kick...",
+                options=options,
+                min_values=1,
+                max_values=1
+            )
+
+            kick_view = discord.ui.View(timeout=60)
+
+            async def select_callback(select_interaction: discord.Interaction):
+                selected_user_id = select_interaction.data["values"][0]
+                selected_member = guild.get_member(int(selected_user_id))
+
+                team["players"] = [
+                    p for p in team.get("players", [])
+                    if str(p) != str(selected_user_id)
+                ]
+
+                try:
+                    if selected_member:
+                        await remove_member_from_team_roles(
+                            selected_member,
+                            team,
+                            reason="Kicked by co-captain"
+                        )
+                except Exception:
+                    pass
+
+                save_all()
+
+                log_transaction(
+                    guild,
+                    f"<@{selected_user_id}> Has Been kicked from **{team.get('name', 'Team')}**"
+                )
+
+                await select_interaction.response.send_message(
+                    f"<@{selected_user_id}> has been kicked from **{team.get('name', 'Team')}**.",
+                    ephemeral=True
+                )
+
+            select.callback = select_callback
+            kick_view.add_item(select)
+
+            await button_interaction.response.send_message(
+                "Choose a player to kick:",
+                view=kick_view,
+                ephemeral=True
+            )
+
+    view = discord.ui.View(timeout=180)
+    view.add_item(CoCaptainInviteButton())
+    view.add_item(CoCaptainKickButton())
+
+    await interaction.response.send_message(
+        build_panel_text(),
+        view=view,
+        ephemeral=True
+    )
+
+
+@tree.command(name="create-team", description="Create a new team and assign its captain")
+@app_commands.describe(
+    captain="The captain of the new team",
+    team_name="The team name",
+    hex_color="Team role color, example: #ff0000"
+)
+async def create_team(
+    interaction: discord.Interaction,
+    captain: discord.Member,
+    team_name: str,
+    hex_color: str
+):
+    if not is_admin_or_above(interaction.user):
+        return await interaction.response.send_message(
+            "Admin permissions required.",
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    guild = interaction.guild
+
+    existing_role = discord.utils.get(guild.roles, name=team_name)
+    if existing_role:
+        return await interaction.followup.send(
+            "A role with that team name already exists.",
+            ephemeral=True
+        )
+
+    try:
+        color = parse_hex_color(hex_color)
+    except Exception:
+        return await interaction.followup.send(
+            "Invalid hex color. Use something like `#ff0000`.",
+            ephemeral=True
+        )
+
+    try:
+        team_role = await guild.create_role(
+            name=team_name,
+            color=color,
+            reason=f"Team created by {interaction.user}"
+        )
+    except Exception as e:
+        return await interaction.followup.send(
+            f"Failed to create team role: `{e}`",
+            ephemeral=True
+        )
+
+    captain_role = get_role_by_cfg(guild, "captain")
+    team_player_role = await get_or_create_team_player_role(guild)
+
+    roles_to_add = [team_role]
+
+    if captain_role:
+        roles_to_add.append(captain_role)
+
+    if team_player_role:
+        roles_to_add.append(team_player_role)
+
+    try:
+        await captain.add_roles(
+            *roles_to_add,
+            reason="Assigned as team captain"
+        )
+    except Exception:
+        pass
+
+    team_id = clean_team_id(team_name)
+
+    # Avoid overwriting if duplicate clean IDs happen
+    original_team_id = team_id
+    counter = 1
+    while team_id in TEAMS:
+        counter += 1
+        team_id = f"{original_team_id}_{counter}"
+
+    TEAMS[team_id] = {
+        "name": team_name,
+        "role_id": str(team_role.id),
+        "captain_id": str(captain.id),
+        "co_captains": [],
+        "players": []
+    }
+
+    save_all()
+
+    tx = f"{captain.mention} Has Become Captain Of **{team_name}**"
+    log_transaction(guild, tx)
+
+    await interaction.followup.send(
+        f"Created **{team_name}** and assigned {captain.mention} as captain.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="disband", description="Disband one team")
+@app_commands.describe(team_role="The team role to disband")
+async def disband(interaction: discord.Interaction, team_role: discord.Role):
+    if not is_admin_or_above(interaction.user):
+        return await interaction.response.send_message(
+            "Admin permissions required.",
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    guild = interaction.guild
+    team_id, team = find_team_by_role_id(team_role.id)
+
+    if not team:
+        return await interaction.followup.send(
+            "That role is not registered as a team role.",
+            ephemeral=True
+        )
+
+    team_name = team.get("name", team_role.name)
+
+    members_to_clean = []
+
+    for member in guild.members:
+        if team_role in member.roles:
+            members_to_clean.append(member)
+
+    captain_id = team.get("captain_id")
+    if captain_id:
+        captain_member = guild.get_member(int(captain_id))
+        if captain_member and captain_member not in members_to_clean:
+            members_to_clean.append(captain_member)
+
+    for cc_id in team.get("co_captains", []):
+        member = guild.get_member(int(cc_id))
+        if member and member not in members_to_clean:
+            members_to_clean.append(member)
+
+    for player_id in team.get("players", []):
+        member = guild.get_member(int(player_id))
+        if member and member not in members_to_clean:
+            members_to_clean.append(member)
+
+    for member in members_to_clean:
+        await remove_team_member_roles(member, team_role)
+
+    try:
+        await team_role.delete(reason=f"Team disbanded by {interaction.user}")
+    except Exception:
+        pass
+
+    TEAMS.pop(team_id, None)
+    save_all()
+
+    tx = f"**{team_name}** Has Been Disbanded"
+    log_transaction(guild, tx)
+
+    await interaction.followup.send(
+        f"Disbanded **{team_name}**.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="disband-all", description="Disband all teams")
+async def disband_all(interaction: discord.Interaction):
+    if not is_admin_or_above(interaction.user):
+        return await interaction.response.send_message(
+            "Admin permissions required.",
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    guild = interaction.guild
+
+    if not TEAMS:
+        return await interaction.followup.send(
+            "There are no teams to disband.",
+            ephemeral=True
+        )
+
+    teams_copy = list(TEAMS.items())
+
+    for team_id, team in teams_copy:
+        role = None
+
+        if team.get("role_id"):
+            role = guild.get_role(int(team["role_id"]))
+
+        members_to_clean = []
+
+        if role:
+            for member in guild.members:
+                if role in member.roles:
+                    members_to_clean.append(member)
+
+        captain_id = team.get("captain_id")
+        if captain_id:
+            member = guild.get_member(int(captain_id))
+            if member and member not in members_to_clean:
+                members_to_clean.append(member)
+
+        for cc_id in team.get("co_captains", []):
+            member = guild.get_member(int(cc_id))
+            if member and member not in members_to_clean:
+                members_to_clean.append(member)
+
+        for player_id in team.get("players", []):
+            member = guild.get_member(int(player_id))
+            if member and member not in members_to_clean:
+                members_to_clean.append(member)
+
+        for member in members_to_clean:
+            await remove_team_member_roles(member, role)
+
+        if role:
+            try:
+                await role.delete(reason=f"All teams disbanded by {interaction.user}")
+            except Exception:
+                pass
+
+    TEAMS.clear()
+    save_all()
+
+    tx = "**All Teams Have Been Disbanded**"
+    log_transaction(guild, tx)
+
+    await interaction.followup.send(
+        "All teams have been disbanded.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="roster-lock-all", description="Lock all rosters")
+async def roster_lock_all(interaction: discord.Interaction):
+    global ROSTER_LOCK_ALL
+
+    if not is_admin(interaction.user):
+        return await interaction.response.send_message("Admin perms required.", ephemeral=True)
+
+    ROSTER_LOCK_ALL = True
+
+    log_transaction(interaction.guild, "**All Rosters Have Been Locked**")
+
+    await interaction.response.send_message("All rosters are now locked.", ephemeral=True)
+
+
+@tree.command(name="unroster-lock-all", description="Unlock all rosters")
+async def unroster_lock_all(interaction: discord.Interaction):
+    global ROSTER_LOCK_ALL
+
+    if not is_admin(interaction.user):
+        return await interaction.response.send_message("Admin perms required.", ephemeral=True)
+
+    ROSTER_LOCK_ALL = False
+
+    log_transaction(interaction.guild, "**All Rosters Have Been Unlocked**")
+
+    await interaction.response.send_message("All rosters are now unlocked.", ephemeral=True)
+
+
+@tree.command(name="admin-add", description="Admin add a player to a team")
+@app_commands.describe(
+    team_role="The team role",
+    user="The user to add"
+)
+async def admin_add(
+    interaction: discord.Interaction,
+    team_role: discord.Role,
+    user: discord.Member
+):
+    if not is_admin_or_above(interaction.user):
+        return await interaction.response.send_message(
+            "Admin permissions required.",
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    team_id, team = find_team_by_role_id(team_role.id)
+
+    if not team:
+        return await interaction.followup.send(
+            "That role is not registered as a team role.",
+            ephemeral=True
+        )
+
+    team_player_role = await get_or_create_team_player_role(interaction.guild)
+
+    roles_to_add = [team_role]
+
+    if team_player_role:
+        roles_to_add.append(team_player_role)
+
+    try:
+        await user.add_roles(
+            *roles_to_add,
+            reason=f"Admin added to team by {interaction.user}"
+        )
+    except Exception as e:
+        return await interaction.followup.send(
+            f"Failed to add roles: `{e}`",
+            ephemeral=True
+        )
+
+    if str(user.id) != str(team.get("captain_id")):
+        if str(user.id) not in [str(x) for x in team.get("players", [])]:
+            team.setdefault("players", []).append(str(user.id))
+
+    save_all()
+
+    tx = f"{user.mention} Has Joined **{team.get('name', team_role.name)}**"
+    log_transaction(interaction.guild, tx)
+
+    await interaction.followup.send(
+        f"Added {user.mention} to **{team.get('name', team_role.name)}**.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="admin-kick", description="Admin remove a player from a team")
+@app_commands.describe(
+    team_role="The team role",
+    user="The user to remove"
+)
+async def admin_kick(
+    interaction: discord.Interaction,
+    team_role: discord.Role,
+    user: discord.Member
+):
+    if not is_admin_or_above(interaction.user):
+        return await interaction.response.send_message(
+            "Admin permissions required.",
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    team_id, team = find_team_by_role_id(team_role.id)
+
+    if not team:
+        return await interaction.followup.send(
+            "That role is not registered as a team role.",
+            ephemeral=True
+        )
+
+    team_player_role = get_team_player_role(interaction.guild)
+
+    roles_to_remove = []
+
+    if team_role in user.roles:
+        roles_to_remove.append(team_role)
+
+    if team_player_role and team_player_role in user.roles:
+        roles_to_remove.append(team_player_role)
+
+    if roles_to_remove:
+        try:
+            await user.remove_roles(
+                *roles_to_remove,
+                reason=f"Admin kicked from team by {interaction.user}"
+            )
+        except Exception as e:
+            return await interaction.followup.send(
+                f"Failed to remove roles: `{e}`",
+                ephemeral=True
+            )
+
+    team["players"] = [
+        p for p in team.get("players", [])
+        if str(p) != str(user.id)
+    ]
+
+    team["co_captains"] = [
+        c for c in team.get("co_captains", [])
+        if str(c) != str(user.id)
+    ]
+
+    save_all()
+
+    tx = f"{user.mention} Has Been Kicked From **{team.get('name', team_role.name)}**"
+    log_transaction(interaction.guild, tx)
+
+    await interaction.followup.send(
+        f"Removed {user.mention} from **{team.get('name', team_role.name)}**.",
+        ephemeral=True
+    )
+
+
 
 # submit-time
 @tree.command(name="submit-time", description="Submit a match time")
@@ -839,13 +2266,20 @@ async def on_ready():
     try:
         gid = int(CONFIG.get("guild_id")) if CONFIG.get("guild_id") else None
         if gid:
-            await tree.sync(guild=discord.Object(id=gid))
+            guild_obj = discord.Object(id=gid)
+            await tree.sync(guild=guild_obj)
+            print(f"Synced commands to guild {gid}")
         else:
             await tree.sync()
-    except Exception:
-        pass
+            print("Synced commands globally")
+    except Exception as e:
+        print(f"Command sync failed: {e}")
+
     print(f"Bot ready. Logged in as {bot.user}")
-    match_notifier.start()
+
+    if not match_notifier.is_running():
+        match_notifier.start()
+
 
 # graceful shutdown save
 @bot.event
