@@ -2255,27 +2255,34 @@ async def addscrim(interaction: discord.Interaction, team1: str, team2: str):
 
 # Auto Warn simple endpoint: add warning and log
 def auto_warn(guild, user_id, reason):
-    WARNINGS.setdefault(str(user_id), []).append({"time": datetime.now(timezone.utc).isoformat(), "reason": reason})
+    WARNINGS.setdefault(str(user_id), []).append({
+        "time": datetime.now(timezone.utc).isoformat(),
+        "reason": reason
+    })
     save_json("warnings", WARNINGS)
     save_all()
     log_transaction(guild, f"<@{user_id}> was auto-warned: {reason}")
 
+
 # on_ready and run tasks
 @bot.event
 async def on_ready():
-    try:
-        gid = int(CONFIG.get("guild_id")) if CONFIG.get("guild_id") else None
-        if gid:
-            guild_obj = discord.Object(id=gid)
-            await tree.sync(guild=guild_obj)
-            print(f"Synced commands to guild {gid}")
-        else:
-            await tree.sync()
-            print("Synced commands globally")
-    except Exception as e:
-        print(f"Command sync failed: {e}")
+    print(f"Logged in as {bot.user}")
 
-    print(f"Bot ready. Logged in as {bot.user}")
+    try:
+        guild = discord.Object(id=int(CONFIG["guild_id"]))
+
+        # Important: copy global commands into this guild before syncing
+        bot.tree.copy_global_to(guild=guild)
+
+        synced = await bot.tree.sync(guild=guild)
+
+        print(f"Synced {len(synced)} guild command(s).")
+        for cmd in synced:
+            print(f" - /{cmd.name}")
+
+    except Exception as e:
+        print(f"Failed to sync commands: {e}")
 
     if not match_notifier.is_running():
         match_notifier.start()
@@ -2285,6 +2292,7 @@ async def on_ready():
 @bot.event
 async def on_disconnect():
     save_all()
+
 
 # run bot
 if __name__ == "__main__":
