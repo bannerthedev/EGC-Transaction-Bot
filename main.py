@@ -20,42 +20,53 @@ load_dotenv()
 # ---- Config loading (env or config.json) ----
 def load_config():
     cfg = {}
-    if os.path.exists("config.json"):
+
+    # Load config.json first if it exists
+    try:
         with open("config.json", "r") as f:
             cfg = json.load(f)
-    # Override with env vars if provided
-env_map = {
-    "GUILD_ID": "guild_id",
-    "ROLE_CAPTAIN_ID": ("roles", "captain"),
-    "ROLE_CO_CAPTAIN_ID": ("roles", "co_captain"),
-    "ROLE_ADMIN_ID": ("roles", "admin"),
-    "ROLE_HEAD_ID": ("roles", "head"),               # Head Ref / Head Staff
-    "ROLE_HEAD_CASTER_ID": ("roles", "head_caster"), # Head Caster
-    "ROLE_HEAD_ID": ("roles", "head"),
-    "ROLE_HEAD_CASTER_ID": ("roles", "head_caster"),
-    "ROLE_REF_ID": ("roles", "referee"),
-    "ROLE_CASTER_ID": ("roles", "caster"),
-    "ROLE_BOARD_ID": ("roles", "board"),
-    "CHANNEL_TRANSACTIONS_ID": "transactions_channel",
-    "DEFAULT_ROSTER_LIMIT": "roster_limit",
-    "DEFAULT_TIMEZONE": "timezone"
-}
+    except FileNotFoundError:
+        cfg = {}
+    except Exception as e:
+        print(f"Could not load config.json: {e}")
+        cfg = {}
 
+    # Environment variables override config.json
+    env_map = {
+        "GUILD_ID": "guild_id",
+        "ROLE_CAPTAIN_ID": ("roles", "captain"),
+        "ROLE_CO_CAPTAIN_ID": ("roles", "co_captain"),
+        "ROLE_ADMIN_ID": ("roles", "admin"),
+        "ROLE_HEAD_ID": ("roles", "head"),
+        "ROLE_HEAD_CASTER_ID": ("roles", "head_caster"),
+        "ROLE_REF_ID": ("roles", "referee"),
+        "ROLE_CASTER_ID": ("roles", "caster"),
+        "ROLE_BOARD_ID": ("roles", "board"),
+        "CHANNEL_TRANSACTIONS_ID": "transactions_channel",
+        "CHANNEL_MATCH_SCORES_ID": "match_scores_channel",
+        "CHANNEL_MATCH_TIMES_ID": "match_times_channel",
+        "CHANNEL_ASSIGNMENTS_ID": "assignments_channel",
+        "DEFAULT_ROSTER_LIMIT": "roster_limit",
+        "DEFAULT_TIMEZONE": "timezone"
+    }
 
     for env, key in env_map.items():
-        v = os.getenv(env)
-        if not v:
+        val = os.getenv(env)
+        if val is None or val == "":
             continue
+
         if isinstance(key, tuple):
-            cfg.setdefault(key[0], {})
-            cfg[key[0]][key[1]] = v
+            section, subkey = key
+            cfg.setdefault(section, {})
+            cfg[section][subkey] = val
         else:
-            cfg[key] = v
-    # normalize types
-    if "roster_limit" in cfg:
-        cfg["roster_limit"] = int(cfg["roster_limit"])
+            cfg[key] = val
+
+    # Defaults
+    cfg.setdefault("roles", {})
     cfg.setdefault("roster_limit", 10)
     cfg.setdefault("timezone", "America/New_York")
+
     return cfg
 
 CONFIG = load_config()
