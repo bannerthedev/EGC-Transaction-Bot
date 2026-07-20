@@ -24,19 +24,24 @@ def load_config():
         with open("config.json", "r") as f:
             cfg = json.load(f)
     # Override with env vars if provided
-    env_map = {
-        "GUILD_ID": "guild_id",
-        "ROLE_CAPTAIN_ID": ("roles", "captain"),
-        "ROLE_CO_CAPTAIN_ID": ("roles", "co_captain"),
-        "ROLE_ADMIN_ID": ("roles", "admin"),
-        "ROLE_HEAD_ID": ("roles", "head"),
-        "ROLE_REF_ID": ("roles", "referee"),
-        "ROLE_CASTER_ID": ("roles", "caster"),
-        "ROLE_BOARD_ID": ("roles", "board"),
-        "CHANNEL_TRANSACTIONS_ID": "transactions_channel",
-        "DEFAULT_ROSTER_LIMIT": "roster_limit",
-        "DEFAULT_TIMEZONE": "timezone"
-    }
+env_map = {
+    "GUILD_ID": "guild_id",
+    "ROLE_CAPTAIN_ID": ("roles", "captain"),
+    "ROLE_CO_CAPTAIN_ID": ("roles", "co_captain"),
+    "ROLE_ADMIN_ID": ("roles", "admin"),
+    "ROLE_HEAD_ID": ("roles", "head"),               # Head Ref / Head Staff
+    "ROLE_HEAD_CASTER_ID": ("roles", "head_caster"), # Head Caster
+    "ROLE_HEAD_ID": ("roles", "head"),
+    "ROLE_HEAD_CASTER_ID": ("roles", "head_caster"),
+    "ROLE_REF_ID": ("roles", "referee"),
+    "ROLE_CASTER_ID": ("roles", "caster"),
+    "ROLE_BOARD_ID": ("roles", "board"),
+    "CHANNEL_TRANSACTIONS_ID": "transactions_channel",
+    "DEFAULT_ROSTER_LIMIT": "roster_limit",
+    "DEFAULT_TIMEZONE": "timezone"
+}
+
+
     for env, key in env_map.items():
         v = os.getenv(env)
         if not v:
@@ -103,10 +108,12 @@ def get_role_by_cfg(guild, role_key):
         "co_captain": "Co-Captain",
         "admin": "Admin",
         "head": "Head",
+        "head_caster": "Head Caster",
         "referee": "Referee",
         "caster": "Caster",
         "board": "Board"
     }
+
     return discord.utils.get(guild.roles, name=names.get(role_key))
 
 def log_transaction(guild, content):
@@ -511,9 +518,9 @@ async def submit_time(interaction: discord.Interaction, week: str, time: str, te
                 team_key = "team2"
             else:
                 # fallback: check membership lists
-                if str(user.id) in [str(x) for x in t1.get("players",[])] + [str(t1.get("captain_id"))] + [str(x) for x in t1.get("co_captains",[])]:
+                if str(user.id) in [str(x) for x in t1.get("players",[])] + [str(t1.get('captain_id'))] + [str(x) for x in t1.get("co_captains",[])]:
                     team_key = "team1"
-                elif str(user.id) in [str(x) for x in t2.get("players",[])] + [str(t2.get("captain_id"))] + [str(x) for x in t2.get("co_captains",[])]:
+                elif str(user.id) in [str(x) for x in t2.get("players",[])] + [str(t2.get('captain_id'))] + [str(x) for x in t2.get("co_captains",[])]:
                     team_key = "team2"
             if not team_key:
                 return await btn_inter.response.send_message("You are not part of the teams involved.", ephemeral=True)
@@ -523,7 +530,7 @@ async def submit_time(interaction: discord.Interaction, week: str, time: str, te
             else:
                 m["accepted"]["team2"] = True
             save_all()
-            # edit original message to show check
+            # respond ephemeral and update original message check (optional)
             await btn_inter.response.send_message(f"Accepted ✅ by {user.mention}", ephemeral=True)
             # if both accepted, post assignments
             if m["accepted"]["team1"] and m["accepted"]["team2"]:
@@ -544,47 +551,64 @@ async def submit_time(interaction: discord.Interaction, week: str, time: str, te
 
 async def post_assignments(guild: discord.Guild, match_id: str):
     m = MATCHES.get(match_id)
-    if not m: return
+    if not m:
+        return
     t1 = TEAMS.get(m["team1_id"])
     t2 = TEAMS.get(m["team2_id"])
-    # find head/refs/casters mentions
-    # For simplicity use role mentions from config if present
-    ref_role = get_role_by_cfg(guild, "referee")
-    caster_role = get_role_by_cfg(guild, "caster")
-    head_role = get_role_by_cfg(guild, "head")
-    ref_mention = f"<@&{ref_role.id}>" if ref_role else "@Referee"
-    caster_mention = f"<@&{caster_role.id}>" if caster_role else "@Caster"
-    head_mention = f"<@&{head_role.id}>" if head_role else "@Head"
 
-    content = f"{head_mention} {ref_mention} {caster_mention}\n{t1.get('name')} vs {t2.get('name')}\n> WEEK: {m.get('week')}\n> Time: <t:{m.get('timestamp')}:F>\n> Referee: {m.get('claims',{}).get('referee') or 'Unassigned'}\n> Caster: {m.get('claims',{}).get('caster') or 'Unassigned'}"
+    # mention staff roles: Head Ref, Head Caster, Referee, Caster
+    head_role = get_role_by_cfg(guild, "head")               # Head Ref / Head Staff
+    head_caster_role = get_role_by_cfg(guild, "head_caster") # Head Caster
+    caster_role = get_role_by_cfg(guild, "caster")
+    ref_role = get_role_by_cfg(guild, "referee")
+
+    head_mention = f"<@&{head_role.id}>" if head_role else "@Head Referee"
+    head_caster_mention = f"<@&{head_caster_role.id}>" if head_caster_role else "@Head Caster"
+    caster_mention = f"<@&{caster_role.id}>" if caster_role else "@Caster"
+    ref_mention = f"<@&{ref_role.id}>" if ref_role else "@Referee"
+
+    content = (
+        f"{head_mention} {ref_mention} {head_caster_mention} {caster_mention}\n"
+        f"{t1.get('name')} vs {t2.get('name')}\n"
+        f"> WEEK: {m.get('week')}\n"
+        f"> Time: <t:{m.get('timestamp')}:F>\n"
+        f"> Referee: {('<@'+m['claims']['referee']+'>') if m['claims'].get('referee') else 'Unassigned'}\n"
+        f"> Caster: {('<@'+m['claims']['caster']+'>') if m['claims'].get('caster') else 'Unassigned'}"
+    )
+
     # buttons: Claim Caster, Claim Referee, Unclaim
     class ClaimButton(discord.ui.Button):
         def __init__(self, role):
-            super().__init__(style=discord.ButtonStyle.primary, label=f"Claim {role}")
+            super().__init__(style=discord.ButtonStyle.primary, label=f"Claim {role.capitalize()}")
             self.role = role
+
         async def callback(self, btn_int):
             user = btn_int.user
             mid = match_id
             mm = MATCHES.get(mid)
-            if not mm: return await btn_int.response.send_message("Match not found.", ephemeral=True)
-            # set claim if not already
+            if not mm:
+                return await btn_int.response.send_message("Match not found.", ephemeral=True)
+            # set claim if not already or if same user
             if mm["claims"].get(self.role) and mm["claims"].get(self.role) != str(user.id):
-                return await btn_int.response.send_message(f"{self.role} already claimed.", ephemeral=True)
+                return await btn_int.response.send_message(f"{self.role.capitalize()} already claimed.", ephemeral=True)
             mm["claims"][self.role] = str(user.id)
             save_all()
             await btn_int.response.send_message(f"You claimed {self.role}.", ephemeral=True)
             # update assignments message if exists
             await update_match_posts(guild, mid)
+
     class UnclaimButton(discord.ui.Button):
         def __init__(self):
             super().__init__(style=discord.ButtonStyle.secondary, label="Unclaim")
+
         async def callback(self, btn_int):
             user = btn_int.user
             mid = match_id
             mm = MATCHES.get(mid)
-            if not mm: return await btn_int.response.send_message("Match not found.", ephemeral=True)
+            if not mm:
+                return await btn_int.response.send_message("Match not found.", ephemeral=True)
             changed = False
-            for role in ["caster","referee"]:
+            for role in ["caster", "referee"]:
                 if mm["claims"].get(role) == str(user.id):
                     mm["claims"][role] = None
                     changed = True
@@ -593,7 +617,7 @@ async def post_assignments(guild: discord.Guild, match_id: str):
                 await btn_int.response.send_message("Your claim(s) removed.", ephemeral=True)
                 await update_match_posts(guild, mid)
             else:
-                await btn_int.response.send_message("You have no claims.", ephemeral=True)
+                await btn_int.response.send_message("You have no claims on this match.", ephemeral=True)
 
     view = discord.ui.View(timeout=None)
     view.add_item(ClaimButton("caster"))
@@ -604,7 +628,7 @@ async def post_assignments(guild: discord.Guild, match_id: str):
     channel = None
     if m.get("post_channel"):
         try:
-            channel = guild.get_channel(int(m["post_channel"]))
+            channel = guild.get_channel(int(m.get("post_channel")))
         except:
             channel = None
     if channel is None:
@@ -617,13 +641,16 @@ async def post_assignments(guild: discord.Guild, match_id: str):
         channel = next((c for c in guild.text_channels if c.permissions_for(guild.me).send_messages), None)
     if not channel:
         return
+
     msg = await channel.send(content, view=view)
     m["assignments_post_id"] = str(msg.id)
     save_all()
 
 async def update_match_posts(guild: discord.Guild, match_id: str):
     m = MATCHES.get(match_id)
-    if not m: return
+    if not m:
+        return
+
     ch = None
     if m.get("post_channel"):
         ch = guild.get_channel(int(m.get("post_channel")))
@@ -633,12 +660,34 @@ async def update_match_posts(guild: discord.Guild, match_id: str):
             ch = guild.get_channel(int(ch_id))
     if not ch:
         return
+
     try:
         msg = await ch.fetch_message(int(m.get("assignments_post_id")))
     except Exception:
         return
-    t1 = TEAMS.get(m["team1_id"]); t2 = TEAMS.get(m["team2_id"])
-    content = f"{get_role_by_cfg(guild,'head') and '<@&'+str(get_role_by_cfg(guild,'head').id)+'>' or '@Head'} {get_role_by_cfg(guild,'referee') and '<@&'+str(get_role_by_cfg(guild,'referee').id)+'>' or '@Referee'} {get_role_by_cfg(guild,'caster') and '<@&'+str(get_role_by_cfg(guild,'caster').id)+'>' or '@Caster'}\n{t1.get('name')} vs {t2.get('name')}\n> WEEK: {m.get('week')}\n> Time: <t:{m.get('timestamp')}:F>\n> Referee: {('<@'+m['claims']['referee']+'>') if m['claims'].get('referee') else 'Unassigned'}\n> Caster: {('<@'+m['claims']['caster']+'>') if m['claims'].get('caster') else 'Unassigned'}"
+
+    t1 = TEAMS.get(m["team1_id"])
+    t2 = TEAMS.get(m["team2_id"])
+
+    head_role = get_role_by_cfg(guild, "head")
+    head_caster_role = get_role_by_cfg(guild, "head_caster")
+    caster_role = get_role_by_cfg(guild, "caster")
+    ref_role = get_role_by_cfg(guild, "referee")
+
+    head_mention = f"<@&{head_role.id}>" if head_role else "@Head Referee"
+    head_caster_mention = f"<@&{head_caster_role.id}>" if head_caster_role else "@Head Caster"
+    caster_mention = f"<@&{caster_role.id}>" if caster_role else "@Caster"
+    ref_mention = f"<@&{ref_role.id}>" if ref_role else "@Referee"
+
+    content = (
+        f"{head_mention} {ref_mention} {head_caster_mention} {caster_mention}\n"
+        f"{t1.get('name')} vs {t2.get('name')}\n"
+        f"> WEEK: {m.get('week')}\n"
+        f"> Time: <t:{m.get('timestamp')}:F>\n"
+        f"> Referee: {('<@'+m['claims']['referee']+'>') if m['claims'].get('referee') else 'Unassigned'}\n"
+        f"> Caster: {('<@'+m['claims']['caster']+'>') if m['claims'].get('caster') else 'Unassigned'}"
+    )
+
     try:
         await msg.edit(content=content)
     except Exception:
@@ -656,29 +705,40 @@ async def match_notifier():
         guild = next(iter(bot.guilds), None)
     if not guild:
         return
-    now_ts = int(datetime.now(tz=ZoneInfo(CONFIG.get("timezone","America/New_York"))).timestamp())
+
+    now_ts = int(datetime.now(tz=ZoneInfo(CONFIG.get("timezone", "America/New_York"))).timestamp())
     for mid, m in list(MATCHES.items()):
-        if m.get("notified_5min"): continue
+        if m.get("notified_5min"):
+            continue
         ts = int(m.get("timestamp"))
+        # 5 min before, with a small grace window
         if ts - now_ts <= 300 and ts - now_ts > -60:
-            # prepare code and DM to refs/casters and post masked code to teams
+            # generate code and mark notified
             code = secrets.token_urlsafe(6).upper()
             m["code"] = code
             m["notified_5min"] = True
             save_all()
+
             # DM to caster and ref claims if present
-            for role in ["caster","referee"]:
-                uid = m.get("claims",{}).get(role)
+            for role in ["caster", "referee"]:
+                uid = m.get("claims", {}).get(role)
                 if uid:
                     member = guild.get_member(int(uid))
                     if member:
                         try:
-                            await member.send("# The Code Is:\n\n# THE CODE\n\n***DO NOT SHARE THIS TO ANYONE. IF YOU DO, YOU WILL BE DEMOTED.***\n\nCode: ||"+code+"||")
+                            await member.send(
+                                "# The Code Is:\n\n"
+                                "# THE CODE\n\n"
+                                "***DO NOT SHARE THIS TO ANYONE. IF YOU DO, YOU WILL BE DEMOTED.***\n\n"
+                                f"Code: ||{code}||"
+                            )
                         except:
                             pass
-            # DM teams in match channel: masked
-            t1 = TEAMS.get(m.get("team1_id")); t2 = TEAMS.get(m.get("team2_id"))
-            # post in match channel or transactions channel
+
+            # Post masked code to the match channel for teams + staff
+            t1 = TEAMS.get(m.get("team1_id"))
+            t2 = TEAMS.get(m.get("team2_id"))
+
             ch = None
             if m.get("post_channel"):
                 ch = guild.get_channel(int(m.get("post_channel")))
@@ -688,7 +748,19 @@ async def match_notifier():
                     ch = guild.get_channel(int(ch_id))
             if ch:
                 try:
-                    await ch.send(f"<@&{t1.get('role_id')}> and <@&{t2.get('role_id')}> \n# CODE IS ||{code}||")
+                    head_role = get_role_by_cfg(guild, "head")
+                    head_caster_role = get_role_by_cfg(guild, "head_caster")
+                    caster_role = get_role_by_cfg(guild, "caster")
+
+                    head_mention = f"<@&{head_role.id}>" if head_role else ""
+                    head_caster_mention = f"<@&{head_caster_role.id}>" if head_caster_role else ""
+                    caster_mention = f"<@&{caster_role.id}>" if caster_role else ""
+
+                    await ch.send(
+                        f"{head_mention} {head_caster_mention} {caster_mention} "
+                        f"<@&{t1.get('role_id')}> and <@&{t2.get('role_id')}> \n"
+                        f"# CODE IS ||{code}||"
+                    )
                 except:
                     pass
 
