@@ -11,6 +11,11 @@ from dateutil import parser as date_parser
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+import dotenv
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 # ---- Config loading (env or config.json) ----
 def load_config():
